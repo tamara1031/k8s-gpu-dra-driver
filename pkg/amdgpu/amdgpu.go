@@ -31,6 +31,17 @@ import (
 	"github.com/golang/glog"
 )
 
+// normalizeToSemver pads a version string to semver 2.0.0 format (X.Y.Z).
+// The amdgpu kernel module on some hardware (e.g. Strix iGPU) reports "1" instead of "1.0.0",
+// which is rejected by the Kubernetes ResourceSlice API.
+func normalizeToSemver(v string) string {
+	parts := strings.Split(v, ".")
+	for len(parts) < 3 {
+		parts = append(parts, "0")
+	}
+	return strings.Join(parts[:3], ".")
+}
+
 // GetDriverVersion reads the AMDGPU driver version
 func GetDriverVersion() string {
 	matches, _ := filepath.Glob("/sys/class/drm/card*/device/driver/module/version")
@@ -46,7 +57,7 @@ func GetDriverVersion() string {
 		}
 		driverVersion := strings.TrimSpace(string(b))
 		if driverVersion != "" {
-			return driverVersion
+			return normalizeToSemver(driverVersion)
 		}
 	}
 
