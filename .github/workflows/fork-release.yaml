@@ -1,0 +1,106 @@
+name: Release (Fork)
+
+# Manual release with automatic version bump.
+# Requires GITHUB_TOKEN write access to contents and packages.
+# If main is branch-protected, create a PAT with bypass permissions
+# and store it as RELEASE_TOKEN secret; replace secrets.GITHUB_TOKEN
+# in the checkout and push steps with secrets.RELEASE_TOKEN.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Bump, Tag & Release
+    if: github.repository != 'ROCm/k8s-gpu-dra-driver'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute new version
+        id: version
+        run: |
+          CURRENT=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)
+          [ -z "$CURRENT" ] && CURRENT="v0.0.0"
+          VERSION="${CURRENT#v}"
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
+          case "${{ inputs.bump }}" in
+            major) NEW="v$((MAJOR+1)).0.0" ;;
+            minor) NEW="v${MAJOR}.$((MINOR+1)).0" ;;
+            patch) NEW="v${MAJOR}.${MINOR}.$((PATCH+1))" ;;
+          esac
+          echo "new=${NEW}" >> "$GITHUB_OUTPUT"
+          echo "golang_version=$(grep -m1 'GOLANG_VERSION:=' env.sh | sed 's/.*GOLANG_VERSION:=\([0-9.]*\).*/\1/')" >> "$GITHUB_OUTPUT"
+          echo "Current: $CURRENT → New: $NEW"
+
+      - name: Update version files
+        run: |
+          NEW="${{ steps.version.outputs.new }}"
+          sed -i "s/: \${VERSION:=v[0-9]*\.[0-9]*\.[0-9]*}/: \${VERSION:=${NEW}}/" env.sh
+          sed -i "s/^version: .*/version: ${NEW}/" helm-charts-k8s/Chart.yaml
+          sed -i "s/^appVersion: .*/appVersion: \"${NEW}\"/" helm-charts-k8s/Chart.yaml
+
+      - name: Commit, tag, and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add env.sh helm-charts-k8s/Chart.yaml
+          git commit -m "chore: bump version to ${{ steps.version.outputs.new }}"
+          git tag "${{ steps.version.outputs.new }}"
+          git push
+          git push origin "${{ steps.version.outputs.new }}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push release image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deployments/container/Dockerfile
+          push: true
+          build-args: |
+            GOLANG_VERSION=${{ steps.version.outputs.golang_version }}
+            VERSION=${{ steps.version.outputs.new }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/k8s-gpu-dra-driver:${{ steps.version.outputs.new }}
+            ghcr.io/${{ github.repository_owner }}/k8s-gpu-dra-driver:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.new }}
+          name: Release ${{ steps.version.outputs.new }}
+          generate_release_notes: true
+          draft: false
