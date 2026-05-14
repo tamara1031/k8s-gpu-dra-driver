@@ -20,7 +20,7 @@
 : ${MODULE:=github.com/ROCm/${DRIVER_NAME}}
 
 # Versioning / metadata
-: ${VERSION:=v0.0.4}
+: ${VERSION:=v0.0.5}
 : ${VENDOR:=amd.com}
 : ${APIS:=gpu/v1alpha1}
 
