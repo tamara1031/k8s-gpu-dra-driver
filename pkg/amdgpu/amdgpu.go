@@ -292,14 +292,6 @@ func getAMDGPUsFromDRI() map[string]map[string]interface{} {
 			continue
 		}
 
-		// Verify AMD vendor (best effort — proceed anyway if sysfs unreadable since /dev/kfd confirms AMD)
-		vendorPath := fmt.Sprintf("/sys/class/drm/%s/device/vendor", cardName)
-		if b, err := os.ReadFile(vendorPath); err == nil {
-			if strings.TrimSpace(string(b)) != "0x1002" {
-				continue
-			}
-		}
-
 		// Find associated renderD via sysfs grouping, falling back to first available
 		renderD := -1
 		drmDir := fmt.Sprintf("/sys/class/drm/%s/device/drm", cardName)
