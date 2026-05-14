@@ -250,7 +250,141 @@ func GetAMDGPUs() map[string]map[string]interface{} {
 
 		devices[filepath.Base(path)] = deviceInfo
 	}
+	if len(devices) == 0 {
+		glog.Warningf("No AMD GPU devices found via sysfs PCI discovery, attempting /dev/dri/ fallback")
+		devices = getAMDGPUsFromDRI()
+	}
+
 	glog.Infof("Devices map: %v", devices)
+	return devices
+}
+
+// getAMDGPUsFromDRI discovers AMD GPUs from /dev/dri/ device files.
+// Used as a fallback in containerized environments (e.g. Incus/LXD) where
+// /sys/module/amdgpu/drivers/pci:amdgpu/ device symlinks are not visible.
+func getAMDGPUsFromDRI() map[string]map[string]interface{} {
+	devices := make(map[string]map[string]interface{})
+
+	if _, err := os.Stat("/dev/kfd"); err != nil {
+		glog.Warningf("KFD device not available, skipping /dev/dri/ fallback: %s", err)
+		return devices
+	}
+
+	cardMatches, _ := filepath.Glob("/dev/dri/card*")
+	if len(cardMatches) == 0 {
+		glog.Warningf("No DRI card devices found in /dev/dri/")
+		return devices
+	}
+
+	globalDriverVersion := GetDriverVersion()
+	if globalDriverVersion == "" {
+		globalDriverVersion = "0.0.0"
+	}
+	topologyInfo := GetTopologyInfo()
+
+	for _, cardPath := range cardMatches {
+		cardName := filepath.Base(cardPath)
+		if len(cardName) <= 4 {
+			continue
+		}
+		cardNum, err := strconv.Atoi(cardName[4:])
+		if err != nil {
+			continue
+		}
+
+		// Verify AMD vendor (best effort — proceed anyway if sysfs unreadable since /dev/kfd confirms AMD)
+		vendorPath := fmt.Sprintf("/sys/class/drm/%s/device/vendor", cardName)
+		if b, err := os.ReadFile(vendorPath); err == nil {
+			if strings.TrimSpace(string(b)) != "0x1002" {
+				continue
+			}
+		}
+
+		// Find associated renderD via sysfs grouping, falling back to first available
+		renderD := -1
+		drmDir := fmt.Sprintf("/sys/class/drm/%s/device/drm", cardName)
+		if entries, err := os.ReadDir(drmDir); err == nil {
+			for _, e := range entries {
+				name := e.Name()
+				if strings.HasPrefix(name, "renderD") {
+					if n, err := strconv.Atoi(name[7:]); err == nil {
+						renderD = n
+						break
+					}
+				}
+			}
+		}
+		if renderD == -1 {
+			if rmatches, _ := filepath.Glob("/dev/dri/renderD*"); len(rmatches) > 0 {
+				rname := filepath.Base(rmatches[0])
+				if n, err := strconv.Atoi(rname[7:]); err == nil {
+					renderD = n
+				}
+			}
+		}
+		if renderD == -1 {
+			glog.Warningf("Could not determine renderD for %s, skipping", cardName)
+			continue
+		}
+
+		numaNode := 0
+		productName := ""
+		sysfsDeviceID := ""
+
+		numaNodePath := fmt.Sprintf("/sys/class/drm/%s/device/numa_node", cardName)
+		if b, err := os.ReadFile(numaNodePath); err == nil {
+			if n, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && n >= 0 {
+				numaNode = n
+			}
+		}
+
+		productNamePath := fmt.Sprintf("/sys/class/drm/%s/device/product_name", cardName)
+		if b, err := os.ReadFile(productNamePath); err == nil {
+			r := strings.NewReplacer(" ", "_", "(", "", ")", "")
+			productName = r.Replace(strings.TrimSpace(string(b)))
+		}
+
+		devIDPath := fmt.Sprintf("/sys/class/drm/%s/device/device", cardName)
+		if b, err := os.ReadFile(devIDPath); err == nil {
+			sysfsDeviceID = strings.TrimSpace(string(b))
+		}
+
+		simdCount, simdPerCU, cuCount := 0, 1, 0
+		var vramBytes uint64
+		kfdID := ""
+		nodeId := 0
+		if info, ok := topologyInfo[renderD]; ok {
+			simdCount = info.SimdCount
+			simdPerCU = info.SimdPerCU
+			cuCount = info.CUCount
+			vramBytes = info.VramBytes
+			kfdID = info.UniqueID
+			nodeId = info.NodeID
+		}
+
+		key := fmt.Sprintf("dri-card%d", cardNum)
+		devices[key] = map[string]interface{}{
+			"card":                 cardNum,
+			"renderD":              renderD,
+			"kfdID":                kfdID,
+			"deviceID":             sysfsDeviceID,
+			"pciAddr":              "",
+			"driverVersion":        globalDriverVersion,
+			"computePartitionType": "",
+			"memoryPartitionType":  "",
+			"numaNode":             numaNode,
+			"nodeId":               nodeId,
+			"productName":          productName,
+			"simdCount":            simdCount,
+			"simdPerCU":            simdPerCU,
+			"cuCount":              cuCount,
+			"vramBytes":            vramBytes,
+		}
+
+		glog.Infof("Discovered AMD GPU via /dev/dri/ fallback: card%d renderD%d (driver: %s)", cardNum, renderD, globalDriverVersion)
+	}
+
+	glog.Infof("Discovered %d AMD GPU devices via /dev/dri/ fallback", len(devices))
 	return devices
 }
 
