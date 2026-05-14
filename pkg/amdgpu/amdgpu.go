@@ -262,8 +262,12 @@ func GetAMDGPUs() map[string]map[string]interface{} {
 // getAMDGPUsFromDRI discovers AMD GPUs from /dev/dri/ device files.
 // Used as a fallback in containerized environments (e.g. Incus/LXD) where
 // /sys/module/amdgpu/drivers/pci:amdgpu/ device symlinks are not visible.
-// KFD topology is used as the authoritative AMD GPU identifier to avoid
-// mistaking non-AMD DRI devices (e.g. VirtIO display adapters) for AMD GPUs.
+//
+// Strategy:
+//  1. KFD topology (if GPU nodes present): authoritative AMD GPU identification
+//  2. /dev/dri/renderD* scan (if KFD topology has no GPU nodes): used when
+//     GPU topology sysfs is incomplete inside the container, but /dev/kfd
+//     confirms AMD GPU presence.
 func getAMDGPUsFromDRI() map[string]map[string]interface{} {
 	devices := make(map[string]map[string]interface{})
 
@@ -272,26 +276,42 @@ func getAMDGPUsFromDRI() map[string]map[string]interface{} {
 		return devices
 	}
 
-	// KFD topology is the authoritative source for AMD GPU identity.
-	// Each entry corresponds to an AMD GPU renderD minor number.
-	topologyInfo := GetTopologyInfo()
-	if len(topologyInfo) == 0 {
-		glog.Warningf("No AMD GPU KFD topology found, skipping /dev/dri/ fallback")
-		return devices
-	}
-
 	globalDriverVersion := GetDriverVersion()
 	if globalDriverVersion == "" {
 		globalDriverVersion = "0.0.0"
 	}
 
+	topologyInfo := GetTopologyInfo()
 	cardMatches, _ := filepath.Glob("/dev/dri/card*")
 
+	// Build the list of renderD numbers to process.
+	// Prefer KFD topology (GPU-only entries); fall back to scanning /dev/dri/renderD*
+	// when the container exposes /dev/kfd but not GPU topology nodes.
+	type renderEntry struct {
+		renderD int
+		topo    *TopologyInfo // nil when sourced from DRI scan
+	}
+	var renderEntries []renderEntry
+
 	for renderD, info := range topologyInfo {
-		// Verify the renderD device is accessible
-		renderDPath := fmt.Sprintf("/dev/dri/renderD%d", renderD)
-		if _, err := os.Stat(renderDPath); err != nil {
-			glog.Warningf("renderD%d from KFD topology not accessible in /dev/dri/, skipping: %s", renderD, err)
+		infoCopy := *info
+		renderEntries = append(renderEntries, renderEntry{renderD, &infoCopy})
+	}
+
+	if len(renderEntries) == 0 {
+		glog.Warningf("KFD topology has no GPU nodes; scanning /dev/dri/renderD* directly (/dev/kfd confirms AMD GPU)")
+		renderMatches, _ := filepath.Glob("/dev/dri/renderD*")
+		for _, p := range renderMatches {
+			if n, err := strconv.Atoi(filepath.Base(p)[7:]); err == nil {
+				renderEntries = append(renderEntries, renderEntry{n, nil})
+			}
+		}
+	}
+
+	for _, entry := range renderEntries {
+		renderD := entry.renderD
+		if _, err := os.Stat(fmt.Sprintf("/dev/dri/renderD%d", renderD)); err != nil {
+			glog.Warningf("renderD%d not accessible: %s", renderD, err)
 			continue
 		}
 
@@ -300,8 +320,7 @@ func getAMDGPUsFromDRI() map[string]map[string]interface{} {
 		cardNum := -1
 		for _, cardPath := range cardMatches {
 			cName := filepath.Base(cardPath)
-			drmDir := fmt.Sprintf("/sys/class/drm/%s/device/drm", cName)
-			entries, err := os.ReadDir(drmDir)
+			entries, err := os.ReadDir(fmt.Sprintf("/sys/class/drm/%s/device/drm", cName))
 			if err != nil {
 				continue
 			}
@@ -323,43 +342,47 @@ func getAMDGPUsFromDRI() map[string]map[string]interface{} {
 		}
 
 		cardName := fmt.Sprintf("card%d", cardNum)
-		productName := ""
-		sysfsDeviceID := ""
-
-		productNamePath := fmt.Sprintf("/sys/class/drm/%s/device/product_name", cardName)
-		if b, err := os.ReadFile(productNamePath); err == nil {
-			r := strings.NewReplacer(" ", "_", "(", "", ")", "")
-			productName = r.Replace(strings.TrimSpace(string(b)))
+		productName, sysfsDeviceID := "", ""
+		if b, err := os.ReadFile(fmt.Sprintf("/sys/class/drm/%s/device/product_name", cardName)); err == nil {
+			productName = strings.NewReplacer(" ", "_", "(", "", ")", "").Replace(strings.TrimSpace(string(b)))
 		}
-
-		devIDPath := fmt.Sprintf("/sys/class/drm/%s/device/device", cardName)
-		if b, err := os.ReadFile(devIDPath); err == nil {
+		if b, err := os.ReadFile(fmt.Sprintf("/sys/class/drm/%s/device/device", cardName)); err == nil {
 			sysfsDeviceID = strings.TrimSpace(string(b))
 		}
 
-		key := fmt.Sprintf("dri-card%d", cardNum)
-		devices[key] = map[string]interface{}{
+		simdCount, simdPerCU, cuCount := 0, 1, 0
+		var vramBytes uint64
+		kfdID, nodeId := "", 0
+		if entry.topo != nil {
+			simdCount = entry.topo.SimdCount
+			simdPerCU = entry.topo.SimdPerCU
+			cuCount = entry.topo.CUCount
+			vramBytes = entry.topo.VramBytes
+			kfdID = entry.topo.UniqueID
+			nodeId = entry.topo.NodeID
+		}
+
+		devices[fmt.Sprintf("dri-card%d", cardNum)] = map[string]interface{}{
 			"card":                 cardNum,
 			"renderD":              renderD,
-			"kfdID":                info.UniqueID,
+			"kfdID":                kfdID,
 			"deviceID":             sysfsDeviceID,
 			"pciAddr":              "",
 			"driverVersion":        globalDriverVersion,
 			"computePartitionType": "",
 			"memoryPartitionType":  "",
-			"numaNode":             info.NodeID,
-			"nodeId":               info.NodeID,
+			"numaNode":             nodeId,
+			"nodeId":               nodeId,
 			"productName":          productName,
-			"simdCount":            info.SimdCount,
-			"simdPerCU":            info.SimdPerCU,
-			"cuCount":              info.CUCount,
-			"vramBytes":            info.VramBytes,
+			"simdCount":            simdCount,
+			"simdPerCU":            simdPerCU,
+			"cuCount":              cuCount,
+			"vramBytes":            vramBytes,
 		}
-
-		glog.Infof("Discovered AMD GPU via KFD+DRI fallback: card%d renderD%d (driver: %s)", cardNum, renderD, globalDriverVersion)
+		glog.Infof("Discovered AMD GPU via DRI fallback: card%d renderD%d (driver: %s)", cardNum, renderD, globalDriverVersion)
 	}
 
-	glog.Infof("Discovered %d AMD GPU devices via KFD+DRI fallback", len(devices))
+	glog.Infof("Discovered %d AMD GPU devices via DRI fallback", len(devices))
 	return devices
 }
 
