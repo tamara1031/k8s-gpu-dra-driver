@@ -1,0 +1,52 @@
+name: Preview Build (Fork)
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: fork-preview-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-push:
+    name: Build & Push Preview
+    if: github.repository != 'ROCm/k8s-gpu-dra-driver'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get build info
+        id: info
+        run: |
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "golang_version=$(grep -m1 'GOLANG_VERSION:=' env.sh | sed 's/.*GOLANG_VERSION:=\([0-9.]*\).*/\1/')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push preview image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deployments/container/Dockerfile
+          push: true
+          build-args: |
+            GOLANG_VERSION=${{ steps.info.outputs.golang_version }}
+            VERSION=main-${{ steps.info.outputs.short_sha }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/k8s-gpu-dra-driver:main
+            ghcr.io/${{ github.repository_owner }}/k8s-gpu-dra-driver:main-${{ steps.info.outputs.short_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
