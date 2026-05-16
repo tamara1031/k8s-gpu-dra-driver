@@ -64,10 +64,14 @@ func (d *AmdGpuInfo) CanonicalName() string {
 
 // GetDevice returns the DRA Device representation for a full AMD GPU
 func (d *AmdGpuInfo) GetDevice() resourceapi.Device {
+	driverVersion := d.DriverVersion
+	if driverVersion == "" {
+		driverVersion = "0.0.0"
+	}
 	attributes := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 		"type":          {StringValue: ptr.To(AmdGpuDeviceType)},
 		"productName":   {StringValue: ptr.To(d.ProductName)},
-		"driverVersion": {VersionValue: ptr.To(d.DriverVersion)},
+		"driverVersion": {VersionValue: ptr.To(driverVersion)},
 		"numaNode":      {IntValue: ptr.To(int64(d.NumaNode))},
 	}
 	if d.DeviceID != "" {
@@ -100,10 +104,14 @@ func (d *AmdPartitionInfo) CanonicalName() string {
 
 // GetDevice returns the DRA Device representation for an AMD GPU partition
 func (d *AmdPartitionInfo) GetDevice() resourceapi.Device {
+	driverVersion := d.Parent.DriverVersion
+	if driverVersion == "" {
+		driverVersion = "0.0.0"
+	}
 	attributes := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 		"type":             {StringValue: ptr.To(AmdPartitionDeviceType)},
 		"productName":      {StringValue: ptr.To(d.Parent.ProductName)},
-		"driverVersion":    {VersionValue: ptr.To(d.Parent.DriverVersion)},
+		"driverVersion":    {VersionValue: ptr.To(driverVersion)},
 		"partitionProfile": {StringValue: ptr.To(d.PartitionProfile)},
 		"numaNode":         {IntValue: ptr.To(int64(d.NumaNode))},
 	}
